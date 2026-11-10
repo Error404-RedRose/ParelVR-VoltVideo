@@ -1,0 +1,748 @@
+using ParelVR.Volt;
+using ParelVR.Volt.Data;
+using ParelVR.Volt.Input;
+using ParelVR.Volt.Interaction;
+using ParelVR.Volt.Networking;
+using ParelVR.Volt.Objects;
+using ParelVR.Volt.Players;
+using ParelVR.Volt.UI;
+using ParelVR.Volt.Video;
+using ParelVR.Volt.Web;
+using UnityEngine;
+
+/// <summary>
+/// The room's video player: paste a link and press Play; everyone in the room watches the same video in sync
+/// (late joiners seek to where it is). Wire the panel's buttons to PlayUrl, TogglePause and StopVideo.
+///
+/// The person who presses Play turns the link into something the player can open, then shares the result:
+///   - YouTube links play as they are
+///   - Internet Archive: archive.org/details/ID, archive.org/download/ID/FILE or ia:ID (picks the item's best video file)
+///   - JSON APIs set up below: a link starting with apiPrefixes[i] calls apiRequests[i] ({id} = the rest of the link,
+///     {url} = the whole link) and plays the URL found at apiUrlFields[i] in the answer (dotted path, e.g. "streams.0.url";
+///     empty = the answer is the URL itself). With apiListFields[i] set ("results", or "$" when the answer itself is a list),
+///     every entry of that list is a choice: apiUrlFields[i] is the URL inside an entry and apiLabelFields[i] its name.
+///   - video files (.mp4, .webm, .m3u8...) play as they are
+///   - with browserServer set, any other link (a website) opens in the shared browser (Tools/stream_resolver/browser.py):
+///     a real Chromium on that server whose screen and sound are streamed live to the TV. Everyone sees it; anyone allowed
+///     (controllers, empty = everyone) points at the screen and pulls the trigger (or clicks, on desktop) to click there,
+///     scrolls with the right stick or the Scroll buttons, and types with the link box + Type / Enter / Delete.
+///     Declare the server's host in the world's web domains.
+/// When there is more than one video (a list answer, or an archive.org item with several episodes), whoever pressed
+/// Play gets a picker over the screen; everyone then watches their choice.
+/// </summary>
+[VoltSync(VoltSyncMode.Manual)]
+public class HotelVideoPlayer : VoltBehaviour
+{
+    public VoltVideoPlayer player;
+    public VoltInputField urlInput;
+    public VoltText statusText;
+    public string defaultUrl = "";
+
+    // The shared browser.
+    public string browserServer = "";   // e.g. https://stream.example.com
+    public string controllers = "";     // display names allowed to use it, comma-separated; empty = everyone
+    public VoltGameObject screen;       // the screen quad (1 x 1 in its own space), to work out where people point
+    public VoltGameObject cursor;       // a small dot on the screen showing where you point (yours only)
+    public Vector3 handAim = Vector3.zero;  // extra rotation of the VR pointing ray, if the controller's forward is off
+
+    public string[] apiPrefixes = new string[0];
+    public string[] apiRequests = new string[0];
+    public string[] apiUrlFields = new string[0];
+    public string[] apiListFields = new string[0];
+    public string[] apiLabelFields = new string[0];
+
+    // The picker: shown over the screen, only for the person choosing.
+    public VoltGameObject picker;
+    public VoltGameObject[] pickButtons = new VoltGameObject[0];
+    public VoltText[] pickLabels = new VoltText[0];
+    public VoltText pickPage;
+
+    [VoltSynced] public string url = "";
+    [VoltSynced] public bool paused = false;
+    [VoltSynced] public int startedAtServerMs = 0;   // server time the video was at 0:00
+    [VoltSynced] public float pausedAt = 0f;
+
+    private string loadedUrl = "";
+
+    // The lookup in progress, if any: which source asked, and for what.
+    private string pendingRequest = "";
+    private int pendingApi = -1;          // -1 = Internet Archive metadata
+    private string pendingArchiveId = "";
+
+    // Browser input. ParelVR allows each player 12 web requests a minute (video loads count too), so events are queued
+    // and sent together; at most InputBudget requests a minute go to the browser, the rest of the allowance stays free.
+    private const int BrowserOpen = -2;
+    private const int InputBudget = 9;
+    private string inputQueue = "";       // "e=..&e=.." waiting to be sent
+    private string inputInFlight = "";
+    private int[] inputSentAt = new int[InputBudget];
+    private int inputSlot = 0;
+    private int scrollQueued = 0;
+    private float aimU = 0.5f, aimV = 0.5f;
+    private bool aiming = false;
+    private bool triggerHeld = false;
+    private float clickCooldown = 0f;
+    private float scrollTimer = 0f;
+    private int liveReloadAt = 0;
+    private int liveFailures = 0;
+
+    private string[] choiceUrls = new string[0];
+    private string[] choiceLabels = new string[0];
+    private int page = 0;
+
+    public override void OnStart()
+    {
+        if (picker != null) picker.SetActive(false);
+        if (cursor != null) cursor.SetActive(false);
+        if (string.IsNullOrEmpty(url) && !string.IsNullOrEmpty(defaultUrl) && VoltNetworking.IsMaster)
+            Resolve(defaultUrl);
+        Apply();
+    }
+
+    public void PlayUrl()
+    {
+        string link = urlInput != null ? urlInput.Text.Trim() : "";
+        if (link.Length == 0) { Status("Paste a video link first"); return; }
+        Resolve(link);
+    }
+
+    public void TogglePause()
+    {
+        if (string.IsNullOrEmpty(url)) return;
+        if (IsLive(url)) { Status("The browser is live: use the page's own pause button"); return; }
+        if (!IsOwner) TakeOwnership();
+        if (paused)
+        {
+            paused = false;
+            startedAtServerMs = VoltNetworking.ServerTimeMs - (int)(pausedAt * 1000f);
+        }
+        else
+        {
+            paused = true;
+            pausedAt = player.Time;
+        }
+        RequestSerialization();
+        Apply();
+    }
+
+    public void StopVideo()
+    {
+        pendingRequest = "";
+        if (IsLive(url)) SendInput(BrowserBase() + "/close"); // shuts the browser down on the server
+        inputQueue = "";
+        scrollQueued = 0;
+        ClosePicker();
+        if (!IsOwner) TakeOwnership();
+        url = "";
+        paused = false;
+        RequestSerialization();
+        Apply();
+    }
+
+    // ---- sources ----
+
+    void Resolve(string link)
+    {
+        pendingRequest = "";
+        ClosePicker();
+        string lower = link.ToLowerInvariant();
+
+        for (int i = 0; i < apiPrefixes.Length; i++)
+        {
+            string prefix = apiPrefixes[i];
+            if (string.IsNullOrEmpty(prefix) || !lower.StartsWith(prefix.ToLowerInvariant())) continue;
+            if (i >= apiRequests.Length || string.IsNullOrEmpty(apiRequests[i])) continue;
+            string id = StripQuery(link.Substring(prefix.Length)).Trim('/');
+            string request = apiRequests[i].Replace("{id}", Escape(id)).Replace("{url}", Escape(link));
+            Lookup(request, i, "");
+            return;
+        }
+
+        string archive = ParseArchive(link, lower);
+        if (archive.Length > 0)
+        {
+            int split = archive.IndexOf('\n');
+            string archiveId = split < 0 ? archive : archive.Substring(0, split);
+            string archiveFile = split < 0 ? "" : archive.Substring(split + 1);
+            if (archiveFile.Length > 0) { Begin(ArchiveDownload(archiveId, archiveFile)); return; }
+            Lookup("https://archive.org/metadata/" + archiveId, -1, archiveId);
+            return;
+        }
+
+        if (string.IsNullOrEmpty(browserServer) || IsYouTube(lower) || IsVideoFile(lower))
+        {
+            Begin(link); // YouTube and video files
+            return;
+        }
+
+        // A website: if the browser is already on the TV just navigate it, otherwise start it there.
+        if (IsLive(url))
+        {
+            if (!CanControl()) return;
+            QueueInput("g" + link);
+            Status("Opening " + link);
+            return;
+        }
+        Lookup(Server() + "/b/open?url=" + Escape(link), BrowserOpen, "");
+    }
+
+    /// <summary>A YouTube video link (ParelVR plays those itself); YouTube's other pages open in the browser.</summary>
+    static bool IsYouTube(string lower)
+    {
+        return lower.Contains("youtu.be/") || (lower.Contains("youtube.com/") &&
+            (lower.Contains("watch?") || lower.Contains("/shorts/") || lower.Contains("/live/") || lower.Contains("/embed/")));
+    }
+
+    static bool IsVideoFile(string lower)
+    {
+        string path = StripQuery(lower);
+        return path.EndsWith(".mp4") || path.EndsWith(".webm") || path.EndsWith(".m3u8") || path.EndsWith(".mov")
+            || path.EndsWith(".m4v") || path.EndsWith(".mkv") || path.EndsWith(".ogv");
+    }
+
+    void Lookup(string request, int api, string archiveId)
+    {
+        var address = new VoltUrl(request);
+        if (!address.IsValid) { Status("That link doesn't look right"); return; }
+        Status("Finding the video...");
+        pendingRequest = address.Value;
+        pendingApi = api;
+        pendingArchiveId = archiveId;
+        VoltWeb.Get(address);
+    }
+
+    public override void OnWebResponse(VoltWebRequest request)
+    {
+        if (inputInFlight.Length > 0 && request.Url == inputInFlight)
+        {
+            inputInFlight = "";
+            if (!request.Success && IsLive(url)) Status("The browser didn't answer; press Play to open it again");
+            return;
+        }
+        if (pendingRequest.Length == 0 || request.Url != pendingRequest) return;
+        pendingRequest = "";
+        if (!request.Success)
+        {
+            Status(pendingApi == BrowserOpen ? "Couldn't reach the browser server" : "Couldn't reach the video's site");
+            return;
+        }
+
+        string text = request.Text;
+        VoltDataToken root;
+        if (pendingApi == BrowserOpen)
+        {
+            VoltData answer = VoltJson.TryParse(text, out root) ? root.Object : null;
+            string stream = answer != null && answer.GetString("status", "") == "ok" ? answer.GetString("url", "") : "";
+            if (stream.Length == 0) { Status(answer != null ? answer.GetString("error", "The browser didn't start") : "The browser didn't start"); return; }
+            liveFailures = 0;
+            Begin(stream);
+            return;
+        }
+        if (pendingApi < 0)
+        {
+            if (!VoltJson.TryParse(text, out root) || !ArchiveChoices(root, pendingArchiveId))
+                Status("No playable video in that archive.org item");
+            return;
+        }
+
+        string urlField = Setting(apiUrlFields, pendingApi);
+        string listField = Setting(apiListFields, pendingApi);
+        if (listField.Length == 0)
+        {
+            string found = "";
+            if (urlField.Length == 0) found = text.Trim();
+            else if (VoltJson.TryParse(text, out root)) found = AsString(Walk(root, urlField));
+            if (found.Length == 0) { Status("The video service didn't return a video"); return; }
+            Begin(found);
+            return;
+        }
+
+        if (!VoltJson.TryParse(text, out root)) { Status("The video service sent something unreadable"); return; }
+        VoltDataToken listToken = listField == "$" ? root : Walk(root, listField);
+        VoltDataList list = listToken.IsNull ? null : listToken.List;
+        if (list == null || list.Count == 0) { Status("The video service didn't return any videos"); return; }
+        string labelField = Setting(apiLabelFields, pendingApi);
+        string[] urls = new string[list.Count];
+        string[] labels = new string[list.Count];
+        int n = 0;
+        for (int i = 0; i < list.Count; i++)
+        {
+            string u = urlField.Length == 0 ? AsString(list[i]) : AsString(Walk(list[i], urlField));
+            if (u.Length == 0) continue;
+            string l = labelField.Length == 0 ? "" : AsString(Walk(list[i], labelField));
+            urls[n] = u;
+            labels[n] = l.Length > 0 ? l : "Video " + (n + 1);
+            n++;
+        }
+        Offer(urls, labels, n);
+    }
+
+    static string Setting(string[] values, int index)
+    {
+        return index >= 0 && index < values.Length && values[index] != null ? values[index] : "";
+    }
+
+    /// <summary>The archive.org item (and file, after a newline) a link points at; "" when it isn't an archive.org link.</summary>
+    static string ParseArchive(string link, string lower)
+    {
+        if (lower.StartsWith("ia:")) return link.Substring(3).Trim();
+        string[] markers = { "archive.org/details/", "archive.org/download/", "archive.org/embed/" };
+        for (int m = 0; m < markers.Length; m++)
+        {
+            int at = lower.IndexOf(markers[m]);
+            if (at < 0) continue;
+            string rest = StripQuery(link.Substring(at + markers[m].Length));
+            int slash = rest.IndexOf('/');
+            string id = slash < 0 ? rest : rest.Substring(0, slash);
+            if (id.Length == 0) return "";
+            // Only download links name a file; a details page's extra path is a view, not a file.
+            string file = m == 1 && slash >= 0 ? rest.Substring(slash + 1) : "";
+            return file.Length > 0 ? id + "\n" + file : id;
+        }
+        return "";
+    }
+
+    /// <summary>
+    /// Offers the item's videos in its most widely playable format (h.264 mp4 first): one plays straight away,
+    /// several (episodes, parts) open the picker. False when the item has no video.
+    /// </summary>
+    bool ArchiveChoices(VoltDataToken root, string id)
+    {
+        VoltData item = root.Object;
+        if (item == null || !item.ContainsKey("files")) return false;
+        VoltDataList files = item["files"].List;
+        if (files == null) return false;
+
+        int[] scores = new int[files.Count];
+        int bestScore = 0;
+        for (int i = 0; i < files.Count; i++)
+        {
+            VoltData f = files[i].Object;
+            if (f == null) continue;
+            string format = f.GetString("format", "").ToLowerInvariant();
+            string lowerName = f.GetString("name", "").ToLowerInvariant();
+            int score = 0;
+            if (format.Contains("h.264")) score = 6;
+            else if (format == "mpeg4") score = 5;
+            else if (format.Contains("mpeg4")) score = 4;
+            else if (lowerName.EndsWith(".mp4")) score = 3;
+            else if (lowerName.EndsWith(".webm")) score = 2;
+            else if (lowerName.EndsWith(".ogv")) score = 1;
+            scores[i] = score;
+            if (score > bestScore) bestScore = score;
+        }
+        if (bestScore == 0) return false;
+
+        string[] urls = new string[files.Count];
+        string[] labels = new string[files.Count];
+        int n = 0;
+        for (int i = 0; i < files.Count; i++)
+        {
+            if (scores[i] != bestScore) continue;
+            VoltData f = files[i].Object;
+            string name = f.GetString("name", "");
+            urls[n] = ArchiveDownload(id, name);
+            string title = f.GetString("title", "");
+            labels[n] = title.Length > 0 ? title : name;
+            n++;
+        }
+        Offer(urls, labels, n);
+        return true;
+    }
+
+    static string ArchiveDownload(string id, string file)
+    {
+        return "https://archive.org/download/" + id + "/" + Escape(file).Replace("%2F", "/");
+    }
+
+    /// <summary>Follows a dotted path ("data.streams.0.url") through a JSON answer; a null token when it isn't there.</summary>
+    static VoltDataToken Walk(VoltDataToken token, string path)
+    {
+        string[] parts = path.Split('.');
+        for (int i = 0; i < parts.Length; i++)
+        {
+            if (token.IsNull) return token;
+            int index;
+            if (int.TryParse(parts[i], out index))
+            {
+                VoltDataList list = token.List;
+                if (list == null || index < 0 || index >= list.Count) return VoltDataToken.Null;
+                token = list[index];
+            }
+            else
+            {
+                VoltData obj = token.Object;
+                if (obj == null || !obj.ContainsKey(parts[i])) return VoltDataToken.Null;
+                token = obj[parts[i]];
+            }
+        }
+        return token;
+    }
+
+    static string AsString(VoltDataToken token)
+    {
+        if (token.IsNull) return "";
+        string s = token.String;
+        return s == null ? "" : s.Trim();
+    }
+
+    static string StripQuery(string s)
+    {
+        int q = s.IndexOf('?');
+        if (q >= 0) s = s.Substring(0, q);
+        int h = s.IndexOf('#');
+        if (h >= 0) s = s.Substring(0, h);
+        return s;
+    }
+
+    static string Escape(string s)
+    {
+        return s.Replace("%", "%25").Replace(" ", "%20").Replace("#", "%23").Replace("?", "%3F")
+                .Replace("&", "%26").Replace("+", "%2B").Replace("/", "%2F").Replace(":", "%3A").Replace("=", "%3D");
+    }
+
+    // ---- picker ----
+
+    void Offer(string[] urls, string[] labels, int count)
+    {
+        if (count == 0) { Status("No playable videos found"); return; }
+        if (count == 1 || picker == null || pickButtons.Length == 0) { Begin(urls[0]); return; }
+        choiceUrls = new string[count];
+        choiceLabels = new string[count];
+        for (int i = 0; i < count; i++) { choiceUrls[i] = urls[i]; choiceLabels[i] = labels[i]; }
+        page = 0;
+        picker.SetActive(true);
+        ShowPage();
+        Status(count + " videos found: pick one");
+    }
+
+    void ShowPage()
+    {
+        int per = pickButtons.Length;
+        int pages = (choiceUrls.Length + per - 1) / per;
+        for (int i = 0; i < per; i++)
+        {
+            int c = page * per + i;
+            bool used = c < choiceUrls.Length;
+            pickButtons[i].SetActive(used);
+            if (used && i < pickLabels.Length) pickLabels[i].Text = choiceLabels[c];
+        }
+        if (pickPage != null) pickPage.Text = "Page " + (page + 1) + " / " + pages;
+    }
+
+    public void NextPage()
+    {
+        int pages = (choiceUrls.Length + pickButtons.Length - 1) / Mathf.Max(1, pickButtons.Length);
+        if (page + 1 < pages) { page++; ShowPage(); }
+    }
+
+    public void PreviousPage()
+    {
+        if (page > 0) { page--; ShowPage(); }
+    }
+
+    public void CancelPick()
+    {
+        ClosePicker();
+        Status(string.IsNullOrEmpty(url) ? "Paste a video link and press Play" : "Playing");
+    }
+
+    void Choose(int slot)
+    {
+        int c = page * pickButtons.Length + slot;
+        if (c >= choiceUrls.Length) return;
+        string chosen = choiceUrls[c];
+        ClosePicker();
+        Begin(chosen);
+    }
+
+    void ClosePicker()
+    {
+        choiceUrls = new string[0];
+        choiceLabels = new string[0];
+        if (picker != null) picker.SetActive(false);
+    }
+
+    // The picker's buttons call these (UI events can't pass the slot).
+    public void Pick0() { Choose(0); }
+    public void Pick1() { Choose(1); }
+    public void Pick2() { Choose(2); }
+    public void Pick3() { Choose(3); }
+    public void Pick4() { Choose(4); }
+    public void Pick5() { Choose(5); }
+    public void Pick6() { Choose(6); }
+    public void Pick7() { Choose(7); }
+
+    // ---- playback ----
+
+    void Begin(string resolved)
+    {
+        if (!IsOwner) TakeOwnership();
+        url = resolved;
+        paused = false;
+        pausedAt = 0f;
+        startedAtServerMs = VoltNetworking.ServerTimeMs;
+        RequestSerialization();
+        Apply();
+    }
+
+    public override void OnDeserialization() { Apply(); }
+
+    void Apply()
+    {
+        if (player == null) return;
+        if (string.IsNullOrEmpty(url))
+        {
+            if (loadedUrl.Length > 0) player.Stop();
+            loadedUrl = "";
+            Status("Paste a video link and press Play");
+            return;
+        }
+        if (url != loadedUrl)
+        {
+            loadedUrl = url;
+            Status("Loading...");
+            player.LoadUrl(new VoltUrl(url));
+            return; // OnVideoReady syncs the time and plays
+        }
+        Sync();
+    }
+
+    void Sync()
+    {
+        if (!player.IsReady) return;
+        if (IsLive(url))
+        {
+            // A live stream can't be seeked; just play what arrives.
+            liveFailures = 0;
+            player.Play();
+            Status(CanControl() ? "Browser: point at the screen and pull the trigger to click" : "Browser");
+            return;
+        }
+        if (paused)
+        {
+            player.Pause();
+            player.Seek(pausedAt);
+            Status("Paused");
+            return;
+        }
+        float target = (VoltNetworking.ServerTimeMs - startedAtServerMs) / 1000f;
+        float duration = player.Duration;
+        if (duration > 1f && !player.Loop && target > duration) target = duration - 0.5f;
+        if (target > 1f && Mathf.Abs(player.Time - target) > 1.5f) player.Seek(target);
+        player.Play();
+        Status("Playing");
+    }
+
+    public override void OnVideoReady(VoltVideoPlayer p) { Sync(); }
+
+    public override void OnVideoError(VoltVideoPlayer p, string error)
+    {
+        if (IsLive(url)) { ReconnectLive(); return; }
+        Status("Couldn't play this link: " + error);
+    }
+
+    public override void OnVideoEnded(VoltVideoPlayer p)
+    {
+        if (IsLive(url)) { ReconnectLive(); return; }
+        Status("Ended");
+    }
+
+    /// <summary>The browser stream dropped: load it again in a few seconds, a few times, then give up.</summary>
+    void ReconnectLive()
+    {
+        liveFailures++;
+        if (liveFailures > 3) { Status("The browser has closed. Type a website and press Play to open it again"); return; }
+        Status("Reconnecting to the browser...");
+        SendCustomEventDelayedSeconds("ReloadLive", 3f * liveFailures);
+    }
+
+    public void ReloadLive()
+    {
+        if (!IsLive(url)) return;
+        loadedUrl = "";
+        Apply();
+    }
+
+    // ---- the shared browser ----
+
+    static bool IsLive(string address)
+    {
+        return address != null && address.Contains("/b/") && address.EndsWith("/live.mp4");
+    }
+
+    string Server()
+    {
+        string s = browserServer.Trim();
+        while (s.EndsWith("/")) s = s.Substring(0, s.Length - 1);
+        return s;
+    }
+
+    /// <summary>https://server/b/ID of the browser on the TV (the stream address without /live.mp4).</summary>
+    string BrowserBase()
+    {
+        return url.Substring(0, url.Length - "/live.mp4".Length);
+    }
+
+    bool CanControl()
+    {
+        if (string.IsNullOrEmpty(controllers)) return true;
+        VoltPlayer me = VoltNetworking.LocalPlayer;
+        if (me == null || !me.IsValid) return false;
+        string name = me.DisplayName.ToLowerInvariant();
+        string[] names = controllers.ToLowerInvariant().Split(',');
+        for (int i = 0; i < names.Length; i++)
+            if (names[i].Trim() == name) return true;
+        return false;
+    }
+
+    public override void OnUpdate()
+    {
+        if (!IsLive(url) || screen == null || !CanControl())
+        {
+            if (aiming) { aiming = false; if (cursor != null) cursor.SetActive(false); }
+            return;
+        }
+        float dt = VoltTime.DeltaTime;
+        if (clickCooldown > 0f) clickCooldown -= dt;
+
+        bool on = Aim();
+        if (on != aiming && cursor != null) cursor.SetActive(on);
+        aiming = on;
+        if (on && cursor != null) cursor.Transform.LocalPosition = new Vector3(aimU - 0.5f, 0.5f - aimV, -0.002f);
+
+        if (VoltVRInput.IsVR)
+        {
+            bool held = VoltVRInput.GetTrigger(VoltHand.Right) > 0.75f;
+            if (held && !triggerHeld && on) Click();
+            triggerHeld = held;
+
+            // Right stick up/down scrolls the page under the pointer.
+            float stick = VoltVRInput.GetStick(VoltHand.Right).y;
+            if (on && Mathf.Abs(stick) > 0.6f)
+            {
+                scrollTimer -= dt;
+                if (scrollTimer <= 0f) { scrollQueued += stick > 0f ? -240 : 240; scrollTimer = 0.25f; }
+            }
+            else scrollTimer = 0f;
+        }
+
+        FlushInput();
+    }
+
+    public override void OnInputAction(VoltInputAction action, bool pressed)
+    {
+        // Desktop: the screen centre is the pointer, and a click is a click. (VR clicks come from the trigger above.)
+        if (!pressed || VoltVRInput.IsVR || !aiming) return;
+        if (action == VoltInputAction.Use || action == VoltInputAction.Interact || action == VoltInputAction.Trigger)
+            Click();
+    }
+
+    /// <summary>
+    /// Where the local player points on the screen, into aimU (across) and aimV (down), both 0..1.
+    /// False (and aimU/aimV left alone) when they aren't pointing at it.
+    /// </summary>
+    bool Aim()
+    {
+        VoltPlayer me = VoltNetworking.LocalPlayer;
+        if (me == null || !me.IsValid) return false;
+        Vector3 origin;
+        Quaternion rotation;
+        if (VoltVRInput.IsVR)
+        {
+            origin = me.GetTrackingPosition(VoltTrackingPoint.RightHand);
+            rotation = me.GetTrackingRotation(VoltTrackingPoint.RightHand) * Quaternion.Euler(handAim);
+        }
+        else
+        {
+            origin = me.GetTrackingPosition(VoltTrackingPoint.Head);
+            rotation = me.GetTrackingRotation(VoltTrackingPoint.Head);
+        }
+        // Into the screen's own space, where it is the square -0.5..0.5 on z = 0.
+        VoltTransform t = screen.Transform;
+        Vector3 a = t.InverseTransformPoint(origin);
+        Vector3 d = t.InverseTransformPoint(origin + rotation * Vector3.forward) - a;
+        if (Mathf.Abs(d.z) < 0.00001f) return false;
+        float along = -a.z / d.z;               // metres along the ray
+        if (along <= 0f || along > 12f) return false;
+        Vector3 hit = a + d * along;
+        if (hit.x < -0.5f || hit.x > 0.5f || hit.y < -0.5f || hit.y > 0.5f) return false;
+        aimU = hit.x + 0.5f;
+        aimV = 0.5f - hit.y;
+        return true;
+    }
+
+    void Click()
+    {
+        if (clickCooldown > 0f) return;
+        clickCooldown = 0.3f;
+        QueueInput("c" + Coord(aimU) + "," + Coord(aimV));
+        if (VoltVRInput.IsVR) VoltVRInput.PlayHaptics(VoltHand.Right, 0.3f, 0.05f);
+    }
+
+    static string Coord(float f)
+    {
+        return ((int)(Mathf.Clamp01(f) * 10000f)).ToString();
+    }
+
+    void QueueInput(string ev)
+    {
+        if (!IsLive(url) || !CanControl()) return;
+        if (inputQueue.Length > 1200) { Status("Slow down: the browser is still catching up"); return; }
+        if (scrollQueued != 0) FoldScroll();
+        inputQueue += (inputQueue.Length > 0 ? "&" : "") + "e=" + Escape(ev);
+    }
+
+    void FoldScroll()
+    {
+        string ev = "w" + scrollQueued + "," + Coord(aimU) + "," + Coord(aimV);
+        scrollQueued = 0;
+        inputQueue += (inputQueue.Length > 0 ? "&" : "") + "e=" + Escape(ev);
+    }
+
+    /// <summary>Sends the queued input in one request when the per-minute allowance has room.</summary>
+    void FlushInput()
+    {
+        if (inputInFlight.Length > 0) return;
+        if (scrollQueued != 0 && inputQueue.Length == 0) FoldScroll();
+        if (inputQueue.Length == 0) return;
+        int now = VoltNetworking.ServerTimeMs;
+        int recent = 0;
+        for (int i = 0; i < inputSentAt.Length; i++)
+            if (inputSentAt[i] != 0 && now - inputSentAt[i] < 61000) recent++;
+        if (recent >= InputBudget) return;
+        string request = BrowserBase() + "/in?" + inputQueue;
+        inputQueue = "";
+        if (SendInput(request))
+        {
+            inputSentAt[inputSlot] = now == 0 ? 1 : now;
+            inputSlot = (inputSlot + 1) % inputSentAt.Length;
+        }
+    }
+
+    bool SendInput(string request)
+    {
+        var address = new VoltUrl(request);
+        if (!address.IsValid) return false;
+        inputInFlight = address.Value;
+        VoltWeb.Get(address);
+        return true;
+    }
+
+    // The panel's browser buttons.
+    public void BrowserType()
+    {
+        string text = urlInput != null ? urlInput.Text : "";
+        if (text.Length == 0) { Status("Type something in the box first"); return; }
+        QueueInput("t" + text);
+    }
+    public void BrowserEnter() { QueueInput("kEnter"); }
+    public void BrowserDelete() { QueueInput("kBackspace"); }
+    public void BrowserBack() { QueueInput("b"); }
+    public void BrowserReload() { QueueInput("r"); }
+    public void BrowserFill() { QueueInput("v"); }
+    public void BrowserScrollUp() { if (IsLive(url) && CanControl()) scrollQueued -= 600; }
+    public void BrowserScrollDown() { if (IsLive(url) && CanControl()) scrollQueued += 600; }
+
+    void Status(string s) { if (statusText != null) statusText.Text = s; }
+}

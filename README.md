@@ -1,0 +1,1 @@
+A port of the original VRChat USharpVideo for vrchat rebuild to run on the ParelVR World SDK.

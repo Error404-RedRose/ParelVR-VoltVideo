@@ -1,0 +1,19 @@
+GitHub push report
+Workspace: E:\GitHub Repos\ParelVR-VoltVideo
+Repository: Error404-RedRose/ParelVR-VoltVideo
+Branch: main
+Mode: clean mirror (all old repo files removed)
+Generated: 2026-11-10T01:11:58.118Z
+
+Pushed: 221 file(s), 12.47 MB
+Unchanged: 0 file(s)
+Removed from GitHub: 1 file(s)
+
+NOT PUSHED (1)
+----------------------------------------
+- Examples/Scenes/VideoPlayerExampleScene/LightingData.asset | 38.13 MB | Git LFS: Git LFS returned no upload URL.
+
+SKIPPED BY SYNC RULES (not attempted)
+----------------------------------------
+- .git/
+- .twix/
